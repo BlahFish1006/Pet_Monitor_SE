@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('bark_detector.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('bark_detector.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
+    ]
+  }
+}
