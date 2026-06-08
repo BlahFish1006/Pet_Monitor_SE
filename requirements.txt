@@ -1,3 +1,13 @@
+# --- Audio core (bark_detector.py) ---
 sounddevice>=0.4.6
 numpy>=1.24.0
 plyer>=2.1.0
+
+# --- Vision core (yolo_world_detector.py) ---
+ultralytics>=8.3.0
+opencv-python>=4.8.0
+matplotlib>=3.7.0
+
+# --- Unified dashboard (pet_dashboard.py) ---
+PySide6>=6.6.0
+av>=11.0.0          # decode the input video's audio track (--audio-source video)

@@ -32,12 +32,16 @@ BASELINE_WINDOW_S = 30
 BASELINE_FRAMES = BASELINE_WINDOW_S * 1000 // FRAME_MS
 
 # A frame counts as "loud" when it exceeds baseline by this margin.
-LOUD_MARGIN_DB = 15.0
+# Barks are often only ~6-10 dB above a noisy room's baseline, so 15 dB was
+# far too strict. Tunable via --loud-margin.
+LOUD_MARGIN_DB = 8.0
 
 # Sustained-barking detection window.
 DETECT_WINDOW_S = 10
 DETECT_FRAMES = DETECT_WINDOW_S * 1000 // FRAME_MS
-LOUD_RATIO = 0.80  # ≥80% of frames in the window must be loud
+# Barking is bursty ("woof ... woof ... woof"), so requiring 80% of frames to
+# be loud almost never fires. 30% catches an intermittent barking episode.
+LOUD_RATIO = 0.30  # fraction of frames in the window that must be loud
 
 # Cooldown so a single barking episode only fires once.
 COOLDOWN_S = 30
@@ -73,13 +77,18 @@ def notify(title: str, message: str) -> None:
     print(f"\a\n*** {title}: {message} ***\n")
 
 
-def process_frame(frame_db: float, state: DetectorState) -> tuple[float, float, bool]:
+def process_frame(
+    frame_db: float,
+    state: DetectorState,
+    loud_margin: float = LOUD_MARGIN_DB,
+    loud_ratio: float = LOUD_RATIO,
+) -> tuple[float, float, bool]:
     """Returns (baseline_db, loud_ratio, triggered)."""
     state.baseline_buf.append(frame_db)
     # Use median for robustness; clamp so a very quiet room doesn't make
     # ordinary speech look like a barking episode.
     baseline = max(float(np.median(state.baseline_buf)), MIN_BASELINE_DBFS)
-    threshold = baseline + LOUD_MARGIN_DB
+    threshold = baseline + loud_margin
 
     is_loud = frame_db > threshold
     state.window_buf.append(is_loud)
@@ -88,14 +97,19 @@ def process_frame(frame_db: float, state: DetectorState) -> tuple[float, float, 
     triggered = False
     window_full = len(state.window_buf) == DETECT_FRAMES
     cooled_down = (time.time() - state.last_alert_ts) > COOLDOWN_S
-    if window_full and ratio >= LOUD_RATIO and cooled_down:
+    if window_full and ratio >= loud_ratio and cooled_down:
         triggered = True
         state.last_alert_ts = time.time()
 
     return baseline, ratio, triggered
 
 
-def run(device: int | None, verbose: bool) -> None:
+def run(
+    device: int | None,
+    verbose: bool,
+    loud_margin: float = LOUD_MARGIN_DB,
+    loud_ratio: float = LOUD_RATIO,
+) -> None:
     audio_q: queue.Queue[np.ndarray] = queue.Queue()
 
     def audio_callback(indata, frames, time_info, status):
@@ -111,7 +125,7 @@ def run(device: int | None, verbose: bool) -> None:
     print("Pet Monitor — Abnormal Barking Detector (MVP)")
     print(f"  sample_rate={SAMPLE_RATE} Hz, frame={FRAME_MS} ms")
     print(f"  baseline window={BASELINE_WINDOW_S}s, detect window={DETECT_WINDOW_S}s")
-    print(f"  trigger when ≥{int(LOUD_RATIO*100)}% of frames exceed baseline+{LOUD_MARGIN_DB}dB")
+    print(f"  trigger when ≥{int(loud_ratio*100)}% of frames exceed baseline+{loud_margin}dB")
     print("Listening... (Ctrl+C to stop)\n")
 
     last_print = 0.0
@@ -126,7 +140,9 @@ def run(device: int | None, verbose: bool) -> None:
         while True:
             frame = audio_q.get()
             frame_db = rms_dbfs(frame)
-            baseline, ratio, triggered = process_frame(frame_db, state)
+            baseline, ratio, triggered = process_frame(
+                frame_db, state, loud_margin, loud_ratio
+            )
 
             now = time.time()
             if verbose and now - last_print > 0.5:
@@ -135,15 +151,27 @@ def run(device: int | None, verbose: bool) -> None:
                     f"  level={frame_db:6.1f} dBFS  baseline={baseline:6.1f}  "
                     f"loud_ratio={ratio*100:5.1f}%  [{bar:<20}]",
                     end="\r",
+                    flush=True,
                 )
                 last_print = now
 
             if triggered:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 msg = (
                     f"Sustained loud audio detected for {DETECT_WINDOW_S}s "
                     f"(level≈{frame_db:.0f} dBFS, baseline≈{baseline:.0f} dBFS)"
                 )
-                print(f"\n[ALERT {time.strftime('%H:%M:%S')}] {msg}")
+                # Print a prominent, owner-facing notification to the terminal.
+                # flush=True so it shows immediately even if stdout is buffered.
+                print(
+                    "\n"
+                    "============================================================\n"
+                    f"🐶 [異常吠叫通知] {ts}\n"
+                    f"   {msg}\n"
+                    "   建議飼主確認寵物狀況。\n"
+                    "============================================================",
+                    flush=True,
+                )
                 notify("Pet Monitor: Abnormal Barking", msg)
 
 
@@ -156,6 +184,14 @@ def main() -> None:
     parser.add_argument("--device", type=int, default=None, help="Input device index")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print live levels")
+    parser.add_argument(
+        "--loud-margin", type=float, default=LOUD_MARGIN_DB,
+        help=f"dB above baseline for a frame to count as loud (default {LOUD_MARGIN_DB})",
+    )
+    parser.add_argument(
+        "--loud-ratio", type=float, default=LOUD_RATIO,
+        help=f"fraction of frames in the window that must be loud (default {LOUD_RATIO})",
+    )
     args = parser.parse_args()
 
     if args.list_devices:
@@ -163,7 +199,7 @@ def main() -> None:
         return
 
     try:
-        run(args.device, args.verbose)
+        run(args.device, args.verbose, args.loud_margin, args.loud_ratio)
     except KeyboardInterrupt:
         print("\nStopped.")
 
