@@ -1,0 +1,237 @@
+{
+  "name": "PET ICD Flow - ALERT_TRIGGER Router",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## ① B.SENSE → B.COMP  (Python / pet_dashboard.py，n8n 僅示意)\n\n**Logic Core 在此**：B.COMP 執行 F.2 邊緣 AI 推論與異常判定。\n\nB.SENSE (F.1.1 影像 / F.1.2 音訊)  ──ICD-SENSE-COMP-001: RAW_AV_STREAM──▶  B.COMP (F.2.1/F.2.3 影像、F.2.2/F.2.4 音訊)\n\n判定完成後產生  →  **ICD-COMP-UI-001 : ALERT_TRIGGER (Event_Type, Confidence_%, Timestamp)**  ⬇︎ 送到下方 B.UI",
+        "height": 380,
+        "width": 980,
+        "color": 4
+      },
+      "id": "note-upstream",
+      "name": "Note B.SENSE/B.COMP",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [40, 40]
+    },
+    {
+      "parameters": {
+        "content": "## ② B.UI 警報器與使用者介面 (n8n 實際執行) — F.3 通知及使用介面\n\n收到 ICD-COMP-UI-001 ALERT_TRIGGER  →  Event Dispatcher 依 **Event_Type** 派送（不做判斷，只派送）  →  F.3.1 觸發本地警示通知\n並寫入 B.STORAGE（ICD-COMP-STORAGE-001 STROE_STATE，F.5 日誌循環覆蓋）",
+        "height": 470,
+        "width": 1120,
+        "color": 5
+      },
+      "id": "note-downstream",
+      "name": "Note B.UI/B.STORAGE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [40, 450]
+    },
+    {
+      "parameters": {},
+      "id": "n-manual",
+      "name": "B.SENSE 感測 (示意)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [110, 230]
+    },
+    {
+      "parameters": {},
+      "id": "n-f111",
+      "name": "F.1.1 擷取影像訊號 (B.SENSE)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [330, 140]
+    },
+    {
+      "parameters": {},
+      "id": "n-f211",
+      "name": "F.2.1 影像物件辨識 (B.COMP)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [560, 140]
+    },
+    {
+      "parameters": {},
+      "id": "n-f231",
+      "name": "F.2.3 影像辨識後處理 (B.COMP)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [790, 140]
+    },
+    {
+      "parameters": {},
+      "id": "n-f112",
+      "name": "F.1.2 擷取音訊訊號 (B.SENSE)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [330, 310]
+    },
+    {
+      "parameters": {},
+      "id": "n-f221",
+      "name": "F.2.2 音訊分貝辨識 (B.COMP)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [560, 310]
+    },
+    {
+      "parameters": {},
+      "id": "n-f241",
+      "name": "F.2.4 分貝過載辨識 (B.COMP)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [790, 310]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "pet-event",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "n-webhook",
+      "name": "ICD-COMP-UI-001 ⇢ ALERT_TRIGGER",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [120, 640],
+      "webhookId": "pet-event-demo"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+                "conditions": [
+                  { "id": "cond-bark", "leftValue": "={{ $json.body.Event_Type }}", "rightValue": "abnormal_barking", "operator": { "type": "string", "operation": "equals" } }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Scenario 1: 吠叫"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+                "conditions": [
+                  { "id": "cond-danger", "leftValue": "={{ $json.body.Event_Type }}", "rightValue": "danger_zone", "operator": { "type": "string", "operation": "equals" } }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Scenario 2: 越界"
+            }
+          ]
+        },
+        "options": { "fallbackOutput": "extra" }
+      },
+      "id": "n-switch",
+      "name": "Event Dispatcher (by Event_Type)",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [420, 640]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "bk-0", "name": "function", "type": "string", "value": "F.3.1 觸發本地警示通知 (B.UI) - 異常吠叫" },
+            { "id": "bk-1", "name": "Event_Type", "type": "string", "value": "={{ $json.body.Event_Type }}" },
+            { "id": "bk-2", "name": "Confidence_%", "type": "string", "value": "={{ $json.body['Confidence_%'] }}" },
+            { "id": "bk-3", "name": "Timestamp", "type": "string", "value": "={{ $json.body.Timestamp }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n-act-bark",
+      "name": "B.UI · F.3.1 異常吠叫警示",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [710, 540]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "dz-0", "name": "function", "type": "string", "value": "F.3.1 觸發本地警示通知 (B.UI) - 禁區越界，播放警告音" },
+            { "id": "dz-1", "name": "Event_Type", "type": "string", "value": "={{ $json.body.Event_Type }}" },
+            { "id": "dz-2", "name": "Confidence_%", "type": "string", "value": "={{ $json.body['Confidence_%'] }}" },
+            { "id": "dz-3", "name": "Timestamp", "type": "string", "value": "={{ $json.body.Timestamp }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n-act-danger",
+      "name": "B.UI · F.3.1 禁區越界警示",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [710, 690]
+    },
+    {
+      "parameters": {},
+      "id": "n-unmatched",
+      "name": "Unmatched",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [710, 830]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "st-0", "name": "interface", "type": "string", "value": "ICD-COMP-STORAGE-001 / STROE_STATE" },
+            { "id": "st-1", "name": "log_entry", "type": "string", "value": "={{ $json.Timestamp }} | {{ $json.Event_Type }} | {{ $json['Confidence_%'] }}%" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n-storage",
+      "name": "B.STORAGE · F.5 日誌 (STROE_STATE)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1000, 615]
+    }
+  ],
+  "connections": {
+    "B.SENSE 感測 (示意)": {
+      "main": [ [
+        { "node": "F.1.1 擷取影像訊號 (B.SENSE)", "type": "main", "index": 0 },
+        { "node": "F.1.2 擷取音訊訊號 (B.SENSE)", "type": "main", "index": 0 }
+      ] ]
+    },
+    "F.1.1 擷取影像訊號 (B.SENSE)": {
+      "main": [ [ { "node": "F.2.1 影像物件辨識 (B.COMP)", "type": "main", "index": 0 } ] ]
+    },
+    "F.2.1 影像物件辨識 (B.COMP)": {
+      "main": [ [ { "node": "F.2.3 影像辨識後處理 (B.COMP)", "type": "main", "index": 0 } ] ]
+    },
+    "F.1.2 擷取音訊訊號 (B.SENSE)": {
+      "main": [ [ { "node": "F.2.2 音訊分貝辨識 (B.COMP)", "type": "main", "index": 0 } ] ]
+    },
+    "F.2.2 音訊分貝辨識 (B.COMP)": {
+      "main": [ [ { "node": "F.2.4 分貝過載辨識 (B.COMP)", "type": "main", "index": 0 } ] ]
+    },
+    "ICD-COMP-UI-001 ⇢ ALERT_TRIGGER": {
+      "main": [ [ { "node": "Event Dispatcher (by Event_Type)", "type": "main", "index": 0 } ] ]
+    },
+    "Event Dispatcher (by Event_Type)": {
+      "main": [
+        [ { "node": "B.UI · F.3.1 異常吠叫警示", "type": "main", "index": 0 } ],
+        [ { "node": "B.UI · F.3.1 禁區越界警示", "type": "main", "index": 0 } ],
+        [ { "node": "Unmatched", "type": "main", "index": 0 } ]
+      ]
+    },
+    "B.UI · F.3.1 異常吠叫警示": {
+      "main": [ [ { "node": "B.STORAGE · F.5 日誌 (STROE_STATE)", "type": "main", "index": 0 } ] ]
+    },
+    "B.UI · F.3.1 禁區越界警示": {
+      "main": [ [ { "node": "B.STORAGE · F.5 日誌 (STROE_STATE)", "type": "main", "index": 0 } ] ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": { "templateCredsSetupCompleted": true }
+}

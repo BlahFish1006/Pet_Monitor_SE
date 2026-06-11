@@ -8,7 +8,12 @@ weights/
 
 # Generated media and detection outputs
 *.mp4
+# keep only the combined demo video (shown in README)
+!demo_video/demo_all.mp4
 out/
+
+# Event logs
+*.log
 
 # Local validation data (downloaded sample images)
 test/

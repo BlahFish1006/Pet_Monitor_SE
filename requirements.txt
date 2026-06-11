@@ -11,3 +11,6 @@ matplotlib>=3.7.0
 # --- Unified dashboard (pet_dashboard.py) ---
 PySide6>=6.6.0
 av>=11.0.0          # decode the input video's audio track (--audio-source video)
+
+# --- n8n integration (n8n_client.py) ---
+requests>=2.31.0    # POST events to an n8n Webhook (Action Output stage)

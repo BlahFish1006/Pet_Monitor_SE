@@ -4,6 +4,14 @@ Local, no-cloud edge-AI for pet monitoring. Combines an **audio core** (abnormal
 continuous barking detection) and a **vision core** (YOLO-World dog/cat detection)
 behind a single **PySide6 dashboard** — everything runs on the local PC.
 
+## Demo
+
+[![Pet Edge Tracking System — demo](demo_video/demo_all.jpg)](demo_video/demo_all.mp4)
+
+▶ **點上方縮圖觀看完整 demo 影片** ([demo_video/demo_all.mp4](demo_video/demo_all.mp4))
+— 即時偵測(狗/貓)、禁區越界警報、異常吠叫、RECENT EVENTS 事件記錄與 n8n 路由。
+（其餘測試影片不納入版本控制；詳見 [PROTOTYPE.md](PROTOTYPE.md)。）
+
 ## Components
 
 | File | Role |
@@ -92,6 +100,46 @@ Qt signals, so a slow video FPS never delays bark detection.
 ```bash
 python make_test_clip.py        # needs images under test/Dog and test/Cat
 ```
+
+## 4. n8n integration (Action Output stage)
+
+Visualize **which stage of the system the demo reaches** by routing events through an
+[n8n](https://n8n.io) workflow. When an event fires, the detectors POST a small JSON
+payload to an n8n **Webhook** node; n8n then represents the "Action Output" stage
+(route by scenario → notify / log).
+
+The workflow routes these event types by scenario: `abnormal_barking` (Scenario 1),
+`danger_zone` (Scenario 2), and `pet_in` / `pet_out` (Scenario 0).
+
+```bash
+# Dashboard posts barking, danger-zone, and pet in/out events
+python pet_dashboard.py --source test_more.mp4 --model dogandcat.pt \
+    --audio-source video --danger-zone auto \
+    --n8n-webhook http://localhost:5678/webhook/pet-event
+
+# Standalone barking detector can post too
+python bark_detector.py -v --n8n-webhook http://localhost:5678/webhook/pet-event
+```
+
+Setup:
+1. In n8n, **Import from File** → [n8n_pet_workflow.json](n8n_pet_workflow.json).
+2. Open the **Webhook (Data Input)** node, copy its Test/Production URL, pass it to `--n8n-webhook`.
+3. Activate the workflow (or click *Listen for test event*). Trigger a bark — the
+   `Webhook → Switch → Action` path lights up live, showing the demo's stage.
+
+Event payload = the **ICD-COMP-UI-001 `ALERT_TRIGGER`** interface (B.COMP → B.UI),
+carrying the three ICD fields `Event_Type, Confidence_%, Timestamp` (see [n8n_client.py](n8n_client.py)):
+
+```json
+{ "interface": "ICD-COMP-UI-001", "signal": "ALERT_TRIGGER", "source_block": "B.COMP",
+  "Event_Type": "danger_zone", "Confidence_%": 47, "Timestamp": "...", "scenario": 2, "message": "..." }
+```
+
+`Confidence_%` = YOLO box confidence ×100 for vision events, loud-ratio ×100 for barking.
+The n8n **Event Dispatcher** routes on `Event_Type` (it dispatches, it does not classify —
+the abnormal-behaviour decision is the Logic Core in B.COMP / Python).
+
+A webhook failure never interrupts detection (errors are logged and swallowed).
 
 ## Performance
 

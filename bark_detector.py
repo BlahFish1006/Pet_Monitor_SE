@@ -22,6 +22,12 @@ try:
 except ImportError:
     _HAS_PLYER = False
 
+try:
+    from n8n_client import build_alert_trigger, send_event
+    _HAS_N8N = True
+except ImportError:
+    _HAS_N8N = False
+
 
 SAMPLE_RATE = 16000
 FRAME_MS = 100
@@ -109,6 +115,7 @@ def run(
     verbose: bool,
     loud_margin: float = LOUD_MARGIN_DB,
     loud_ratio: float = LOUD_RATIO,
+    n8n_webhook: str | None = None,
 ) -> None:
     audio_q: queue.Queue[np.ndarray] = queue.Queue()
 
@@ -174,6 +181,15 @@ def run(
                 )
                 notify("Pet Monitor: Abnormal Barking", msg)
 
+                if n8n_webhook and _HAS_N8N:
+                    send_event(n8n_webhook, build_alert_trigger(
+                        event_type="abnormal_barking",
+                        confidence_pct=round(ratio * 100),
+                        timestamp=ts,
+                        scenario=1,
+                        message=msg,
+                    ))
+
 
 def list_devices() -> None:
     print(sd.query_devices())
@@ -192,6 +208,10 @@ def main() -> None:
         "--loud-ratio", type=float, default=LOUD_RATIO,
         help=f"fraction of frames in the window that must be loud (default {LOUD_RATIO})",
     )
+    parser.add_argument(
+        "--n8n-webhook", type=str, default=None,
+        help="n8n Webhook URL to POST barking events to (Action Output stage)",
+    )
     args = parser.parse_args()
 
     if args.list_devices:
@@ -199,7 +219,8 @@ def main() -> None:
         return
 
     try:
-        run(args.device, args.verbose, args.loud_margin, args.loud_ratio)
+        run(args.device, args.verbose, args.loud_margin, args.loud_ratio,
+            n8n_webhook=args.n8n_webhook)
     except KeyboardInterrupt:
         print("\nStopped.")
 

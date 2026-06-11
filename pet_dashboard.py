@@ -29,6 +29,17 @@ import numpy as np
 import bark_detector as bd
 import yolo_world_detector as yw
 
+try:
+    from n8n_client import build_alert_trigger, send_event
+    _HAS_N8N = True
+except ImportError:
+    _HAS_N8N = False
+
+# Classes the vision core detects. Only pets are in the vocabulary, so non-pets
+# (people, furniture, ...) are simply never detected — no false-positive alarms.
+PET_CLASSES = {"dog", "cat"}
+DEFAULT_DETECT_CLASSES = ["dog", "cat"]
+
 # --- Qt -----------------------------------------------------------------------
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QImage, QPixmap, QFont
@@ -66,7 +77,7 @@ class AudioWorker(QThread):
 
     def __init__(self, audio_source="mic", device=None, video_path=None,
                  loop=True, loud_margin=bd.LOUD_MARGIN_DB,
-                 loud_ratio=bd.LOUD_RATIO, parent=None):
+                 loud_ratio=bd.LOUD_RATIO, n8n_webhook=None, parent=None):
         super().__init__(parent)
         self.audio_source = audio_source
         self.device = device
@@ -74,6 +85,7 @@ class AudioWorker(QThread):
         self.loop = loop
         self.loud_margin = loud_margin
         self.loud_ratio = loud_ratio
+        self.n8n_webhook = n8n_webhook
         self._running = True
         self._last_emit = 0.0
 
@@ -104,6 +116,11 @@ class AudioWorker(QThread):
             )
             self.bark_alert.emit(msg, ts)
             bd.notify("Pet Monitor: Abnormal Barking", msg)  # reuse core OS notification
+            if self.n8n_webhook and _HAS_N8N:
+                send_event(self.n8n_webhook, build_alert_trigger(
+                    event_type="abnormal_barking", confidence_pct=round(ratio * 100),
+                    timestamp=ts, scenario=1, message=msg,
+                ))
 
     def run(self):
         if self.audio_source == "video":
@@ -200,11 +217,12 @@ class VideoWorker(QThread):
     """Reads frames from a video file, runs YOLO-World per (strided) frame,
     emits the annotated frame, FPS, and per-class detection counts."""
 
-    frame_ready = Signal(object, float, dict)   # (QImage, fps, {"dog": n, "cat": m})
+    frame_ready = Signal(object, float, dict)   # (QImage, fps, {"dog":n,"cat":m})
+    pet_event = Signal(str, str, str)           # (kind, label, timestamp)
     finished_video = Signal()
 
     def __init__(self, model, source, conf=yw.DEFAULT_CONF, loop=True,
-                 stride=1, imgsz=480, parent=None):
+                 stride=1, imgsz=480, n8n_webhook=None, danger_zone=None, parent=None):
         super().__init__(parent)
         self.model = model
         self.source = source
@@ -212,7 +230,14 @@ class VideoWorker(QThread):
         self.loop = loop
         self.stride = max(1, int(stride))
         self.imgsz = imgsz
+        self.n8n_webhook = n8n_webhook
+        self.danger_zone = danger_zone   # (x1,y1,x2,y2) normalized 0-1, or None
         self._running = True
+        # Scenario 0 (pet in/out) + Scenario 2 (danger zone) tracking state
+        self._pet_state = None           # None / "present" / "absent"
+        self._last_pet_seen = 0.0
+        self._zone_occupied = False
+        self._last_danger = 0.0
 
     def stop(self):
         self._running = False
@@ -221,6 +246,70 @@ class VideoWorker(QThread):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         return QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+
+    def _fire_event(self, kind, scenario, label, message, confidence=None, to_n8n=True):
+        """Emit a GUI event (RECENT EVENTS + banner + log); optionally POST the
+        ICD-COMP-UI-001 ALERT_TRIGGER to n8n.
+
+        pet_in/pet_out are kept local-only (to_n8n=False) so they don't show up
+        as "Unmatched" in the n8n routing demo.
+        """
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.pet_event.emit(kind, label, ts)
+        if to_n8n and self.n8n_webhook and _HAS_N8N:
+            send_event(self.n8n_webhook, build_alert_trigger(
+                event_type=kind, confidence_pct=confidence, timestamp=ts,
+                scenario=scenario, message=message,
+            ))
+
+    def _zone_pixels(self, w, h):
+        x1, y1, x2, y2 = self.danger_zone
+        return int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)
+
+    def _detect_red_zone(self, bgr):
+        """Find a red 'Forbidden Zone' box drawn in the frame -> (x1,y1,x2,y2) px."""
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        mask = (cv2.inRange(hsv, (0, 90, 90), (10, 255, 255)) |
+                cv2.inRange(hsv, (170, 90, 90), (180, 255, 255)))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return None
+        c = max(cnts, key=cv2.contourArea)
+        if cv2.contourArea(c) < 0.008 * bgr.shape[0] * bgr.shape[1]:
+            return None
+        x, y, w, h = cv2.boundingRect(c)
+        return (x, y, x + w, y + h)
+
+    def _check_intrusion(self, pet_boxes, zone_px):
+        """Scenario 2: fire a warning when a pet bbox enters the zone (debounced).
+        Confidence_% = the highest YOLO confidence among pets inside the zone."""
+        zx1, zy1, zx2, zy2 = zone_px
+        best_conf = None
+        for bx1, by1, bx2, by2, cf in pet_boxes:
+            if not (bx2 < zx1 or bx1 > zx2 or by2 < zy1 or by1 > zy2):
+                best_conf = cf if best_conf is None else max(best_conf, cf)
+        occupied = best_conf is not None
+        if occupied and not self._zone_occupied and (time.time() - self._last_danger) > 10:
+            self._fire_event("danger_zone", 2, "禁區警報",
+                             "Pet entered forbidden zone", confidence=round(best_conf * 100))
+            self._last_danger = time.time()
+        self._zone_occupied = occupied
+
+    def _update_inout(self, counts):
+        """Scenario 0: fire pet_out when pets leave the frame >2 s, pet_in on return."""
+        pets = counts.get("dog", 0) + counts.get("cat", 0)
+        now = time.time()
+        if pets > 0:
+            self._last_pet_seen = now
+            if self._pet_state == "absent":
+                self._fire_event("pet_in", 0, "寵物返回", "Pet entered frame", to_n8n=False)
+            self._pet_state = "present"
+        elif self._pet_state == "present" and now - self._last_pet_seen > 2.0:
+            self._fire_event("pet_out", 0, "寵物外出", "Pet left frame", to_n8n=False)
+            self._pet_state = "absent"
+        elif self._pet_state is None:
+            self._pet_state = "absent"
 
     def run(self):
         cap = cv2.VideoCapture(self.source)
@@ -252,12 +341,34 @@ class VideoWorker(QThread):
                 r = results[0]
                 last_annotated = r.plot()
                 counts = {"dog": 0, "cat": 0}
+                pet_boxes = []   # list of (x1, y1, x2, y2, conf)
                 if r.boxes is not None:
-                    for c in r.boxes.cls.tolist():
+                    for c, box, cf in zip(r.boxes.cls.tolist(),
+                                          r.boxes.xyxy.tolist(),
+                                          r.boxes.conf.tolist()):
                         name = self.model.names[int(c)]
                         if name in counts:
                             counts[name] += 1
+                        if name in PET_CLASSES:
+                            pet_boxes.append((*box, cf))
                 last_counts = counts
+
+                # Scenario 2: danger zone. "auto" reads the red box drawn in the
+                # video; a tuple is a fixed ROI we draw ourselves.
+                if self.danger_zone == "auto":
+                    zp = self._detect_red_zone(frame)
+                    if zp:
+                        self._check_intrusion(pet_boxes, zp)
+                elif self.danger_zone:
+                    h, w = last_annotated.shape[:2]
+                    zx1, zy1, zx2, zy2 = self._zone_pixels(w, h)
+                    cv2.rectangle(last_annotated, (zx1, zy1), (zx2, zy2), (0, 0, 255), 2)
+                    cv2.putText(last_annotated, "DANGER ZONE",
+                                (zx1, max(zy1 - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6, (0, 0, 255), 2)
+                    self._check_intrusion(pet_boxes, (zx1, zy1, zx2, zy2))
+                # Scenario 0: pet in/out events.
+                self._update_inout(counts)
             display = last_annotated if last_annotated is not None else frame
             idx += 1
 
@@ -287,6 +398,13 @@ ALERT = "#e5484d"
 TEXT = "#e6edf3"
 MUTED = "#8b949e"
 
+# RECENT EVENTS / banner colour + emoji per event kind.
+EVENT_STYLES = {
+    "danger_zone": ("#e5484d", "🚨"),
+    "pet_out": ("#3b82f6", "🚪"),
+    "pet_in": ("#3fb950", "🏠"),
+}
+
 
 class StatusRow(QLabel):
     def __init__(self, text=""):
@@ -315,6 +433,7 @@ class MainWindow(QMainWindow):
 
         self._start_ts = time.time()
         self._last_qimage = None  # keep latest frame for event thumbnails
+        self.log_path = getattr(args, "log_file", "events.log") or None
 
         # ---------------- Header ----------------
         self.status_lbl = QLabel("CURRENT STATUS: MONITORING")
@@ -404,15 +523,18 @@ class MainWindow(QMainWindow):
         # ---------------- Workers ----------------
         self.video_worker = VideoWorker(
             model, args.source, conf=args.conf, loop=not args.no_loop,
-            stride=args.stride,
+            stride=args.stride, n8n_webhook=args.n8n_webhook,
+            danger_zone=args.danger_zone,
         )
         self.video_worker.frame_ready.connect(self.on_frame)
+        self.video_worker.pet_event.connect(self.on_pet_event)
         self.video_worker.finished_video.connect(self.on_video_finished)
 
         self.audio_worker = AudioWorker(
             audio_source=args.audio_source, device=args.device,
             video_path=args.source, loop=not args.no_loop,
             loud_margin=args.loud_margin, loud_ratio=args.loud_ratio,
+            n8n_webhook=args.n8n_webhook,
         )
         self.audio_worker.status.connect(self.on_audio_status)
         self.audio_worker.bark_alert.connect(self.on_bark_alert)
@@ -445,26 +567,49 @@ class MainWindow(QMainWindow):
         self.baseline_row.setText(f"BASELINE: {baseline:6.1f} dBFS")
         self.ratio_row.setText(f"LOUD RATIO: {ratio*100:5.1f}%  [{bar:<20}]")
 
-    def on_bark_alert(self, message, timestamp):
-        self.banner.setText(f"🐶 異常吠叫通知  {timestamp}\n{message}")
+    def _show_banner(self, text, color, ms=6000):
+        self.banner.setStyleSheet(
+            f"background:{color}; color:white; font-size:16px; font-weight:bold; padding:8px;"
+        )
+        self.banner.setText(text)
         self.banner.show()
-        self._banner_timer.start(6000)
-        self._add_event("異常吠叫", timestamp.split(" ")[-1])
+        self._banner_timer.start(ms)
+
+    def _log_event(self, kind, label, ts, detail=""):
+        """Append an event to the on-disk log (紀錄日誌)."""
+        if not self.log_path:
+            return
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"{ts} | {kind} | {label} | {detail}\n")
+        except Exception as e:
+            print(f"[warn] log write failed: {e}", file=sys.stderr)
+
+    def on_bark_alert(self, message, timestamp):
+        self._show_banner(f"🔊 異常吠叫通知  {timestamp}\n{message}", ALERT)
+        self._add_event("異常吠叫", timestamp.split(" ")[-1], ALERT)
+        self._log_event("abnormal_barking", "異常吠叫", timestamp, message)
+
+    def on_pet_event(self, kind, label, timestamp):
+        color, emoji = EVENT_STYLES.get(kind, (ACCENT, ""))
+        self._show_banner(f"{emoji} {label}  {timestamp}", color, 4000)
+        self._add_event(label, timestamp.split(" ")[-1], color)
+        self._log_event(kind, label, timestamp)
 
     def on_video_finished(self):
         self.status_lbl.setText("CURRENT STATUS: VIDEO ENDED")
         self.status_lbl.setStyleSheet(f"color:{MUTED}; font-size:18px; font-weight:bold;")
 
-    def _add_event(self, label, ts):
+    def _add_event(self, label, ts, color="#e5484d"):
         cell = QVBoxLayout()
         thumb = QLabel()
         thumb.setFixedSize(150, 84)
-        thumb.setStyleSheet("border:2px solid #e5484d;")
+        thumb.setStyleSheet(f"border:2px solid {color};")
         if self._last_qimage is not None:
             thumb.setPixmap(QPixmap.fromImage(self._last_qimage).scaled(
                 150, 84, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
         else:
-            thumb.setStyleSheet("background:#000; border:2px solid #e5484d;")
+            thumb.setStyleSheet(f"background:#000; border:2px solid {color};")
         cap = QLabel(f"{label}\n{ts}")
         cap.setStyleSheet(f"color:{TEXT}; font-size:11px;")
         cap.setAlignment(Qt.AlignCenter)
@@ -509,10 +654,36 @@ def main():
                         help="dB above baseline for a frame to count as loud")
     parser.add_argument("--loud-ratio", type=float, default=bd.LOUD_RATIO,
                         help="fraction of frames in the window that must be loud")
+    parser.add_argument("--n8n-webhook", type=str, default=None,
+                        help="n8n Webhook URL to POST events to (Action Output stage)")
+    parser.add_argument("--classes", type=str, default=",".join(DEFAULT_DETECT_CLASSES),
+                        help="Comma-separated detection vocabulary (pets=dog,cat trigger events; others shown as ignored)")
+    parser.add_argument("--danger-zone", type=str, default=None,
+                        help="Scenario 2 forbidden zone: 'auto' to detect a red box drawn in the "
+                             "video, or x1,y1,x2,y2 normalized 0-1 (e.g. 0.04,0.45,0.30,0.92)")
+    parser.add_argument("--log-file", type=str, default="events.log",
+                        help="Append events to this log file (use '' to disable)")
     args = parser.parse_args()
+
+    if args.danger_zone and args.danger_zone != "auto":
+        try:
+            args.danger_zone = tuple(float(v) for v in args.danger_zone.split(","))
+            assert len(args.danger_zone) == 4
+        except Exception:
+            parser.error("--danger-zone must be 'auto' or 4 comma-separated floats: x1,y1,x2,y2")
 
     print(f"[*] Loading vision model: {args.model}")
     model = yw.load_model(args.model)
+    classes = [c.strip() for c in args.classes.split(",") if c.strip()]
+    try:
+        model.set_classes(classes)
+        # set_classes updates the detection embeddings but NOT model.names, so a
+        # newly-added class (e.g. person -> id 2) would break r.plot() and lookups.
+        # Force the id->name map to match the class order we passed.
+        model.model.names = {i: c for i, c in enumerate(classes)}
+        print(f"[*] Detection classes: {classes}  (pets={sorted(PET_CLASSES)})")
+    except Exception as e:
+        print(f"[warn] set_classes failed, using model defaults: {e}")
 
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
